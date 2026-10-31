@@ -1,0 +1,28 @@
+--- a/src/app/facet/kit/MainActivity.java
++++ b/src/app/facet/kit/MainActivity.java
+@@ -243,6 +243,25 @@
+         }
+     };
+ 
++    /** 打开应用时补一次同步。
++     *  MIUI 会冻结后台进程，system_server 发来的「主题包变了」广播可能一直没被执行，
++     *  导致图标掉了之后再也回不来；这里在每次启动进程后兜底一次。 */
++    private static boolean resumeSynced;
++
++    @Override
++    protected void onResume() {
++        super.onResume();
++        if (resumeSynced) return;
++        resumeSynced = true;
++        new Thread(() -> {
++            try {
++                ThemeIcons.sync(MainActivity.this, false);
++            } catch (Throwable ignored) {
++                // 补同步失败不影响界面
++            }
++        }).start();
++    }
++
+     private void updateStatus() {
+         int count = 0;
+         Set<String> pkgs = new HashSet<>();

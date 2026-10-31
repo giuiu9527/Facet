@@ -70,6 +70,12 @@ public class Hook implements IXposedHookLoadPackage {
     private static final Map<String, String> origLabels = new ConcurrentHashMap<>();
     private static final ThreadLocal<Boolean> bypass = new ThreadLocal<>();
 
+    /** 当前进程包名 / 是否桌面进程：用来判断自定义图标该不该出现在这个位置。 */
+    private static volatile String procPkg = "";
+    private static volatile boolean procIsLauncher;
+    /** 每个应用的替换范围：t_<包名> → all / desk / notif，缺省视为 all。 */
+    private static volatile Map<String, String> modes = Collections.emptyMap();
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) throws Throwable {
         if (Const.SELF.equals(lp.packageName)) {
@@ -90,6 +96,8 @@ public class Hook implements IXposedHookLoadPackage {
             return;
         }
         synchronized (Hook.class) {
+            procPkg = lp.packageName;
+            procIsLauncher = LAUNCHERS.contains(lp.packageName);
             if (!frameworkHooked) {
                 frameworkHooked = true;
                 prefs = new XSharedPreferences(Const.SELF, Const.PREFS);
@@ -147,6 +155,7 @@ public class Hook implements IXposedHookLoadPackage {
         Map<String, Integer> t = new HashMap<>();
         Map<String, String> cc = new HashMap<>();
         Map<String, String> mk = new HashMap<>();
+        Map<String, String> md = new HashMap<>();
         if (all != null) {
             for (Map.Entry<String, ?> e : all.entrySet()) {
                 String k = e.getKey();
@@ -169,6 +178,8 @@ public class Hook implements IXposedHookLoadPackage {
                     cc.put(k.substring(Const.COUNTRY.length()), (String) v);
                 } else if (k.startsWith(Const.MAKER) && v instanceof String && !((String) v).isEmpty()) {
                     mk.put(k.substring(Const.MAKER.length()), (String) v);
+                } else if (k.startsWith(Const.MODE) && v instanceof String && !((String) v).isEmpty()) {
+                    md.put(k.substring(Const.MODE.length()), (String) v);
                 }
                 // 启动器缓存失效用：同一个包（含它的分身）的名称/图标/形状配置合成一个摘要
                 if (k.startsWith(Const.NAME) || k.startsWith(Const.ICON) || k.startsWith(Const.SHAPE)) {
@@ -185,6 +196,7 @@ public class Hook implements IXposedHookLoadPackage {
         tokens = t;
         countries = cc;
         makers = mk;
+        modes = md;
         rawCache.clear();
         styledCache.clear();
     }
@@ -228,6 +240,17 @@ public class Hook implements IXposedHookLoadPackage {
         if (pkg == null) return false;
         refresh();
         return icons.containsKey(pkg);
+    }
+
+    /**
+     * 该应用的自定义图标是否允许出现在指定位置。
+     * 旧配置没有 t_ 键 → 视为「全部」，与之前行为一致。
+     */
+    private static boolean allow(String pkg, boolean desktop) {
+        if (pkg == null) return false;
+        String mode = modes.get(pkg);
+        if (mode == null) return true;
+        return desktop ? !Const.MODE_NOTIF.equals(mode) : !Const.MODE_DESK.equals(mode);
     }
 
     private static Bitmap rawBitmap(String pkg) {
@@ -303,6 +326,7 @@ public class Hook implements IXposedHookLoadPackage {
     }
 
     private static Drawable iconFor(String pkg, Resources res) {
+        if (!allow(pkg, procIsLauncher)) return null;
         Resources r = res != null ? res : Resources.getSystem();
         if (!hasMiuiIconEngine()) {
             if (!hasIcon(pkg)) return null;
@@ -328,6 +352,7 @@ public class Hook implements IXposedHookLoadPackage {
 
     /** SystemUI 的图标缓存要求是 Bitmap。 */
     private static Bitmap sysuiBitmap(String pkg) {
+        if (!allow(pkg, false)) return null;
         return styledBitmap(pkg);
     }
 
@@ -386,6 +411,7 @@ public class Hook implements IXposedHookLoadPackage {
                 ApplicationInfo owner = ai != null ? ai : item instanceof ApplicationInfo ? (ApplicationInfo) item
                         : item instanceof ComponentInfo ? ((ComponentInfo) item).applicationInfo : null;
                 String key = key(item.packageName, userOf(owner));
+                if (!allow(key, procIsLauncher || isLauncherCaller(param.thisObject))) return;
                 if (!hasIcon(key)) return;
                 boolean sameAsApp = item instanceof ApplicationInfo || item.icon == 0
                         || (ai != null && item.icon == ai.icon);
@@ -405,6 +431,7 @@ public class Hook implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 String k = keyOf((LauncherActivityInfo) param.thisObject);
+                if (!allow(k, procIsLauncher)) return;
                 Drawable d = k == null ? null : iconFor(k, null);
                 if (d != null) param.setResult(d);
             }
@@ -569,10 +596,13 @@ public class Hook implements IXposedHookLoadPackage {
             };
             themeObserver = new android.os.FileObserver(new java.io.File(ThemeIcons.THEME_DIR),
                     android.os.FileObserver.CLOSE_WRITE | android.os.FileObserver.MOVED_TO
-                            | android.os.FileObserver.CREATE) {
+                            | android.os.FileObserver.CREATE
+                            // 系统重建/清理主题包时是「删除后再创建」，只监听创建会漏掉删除那一步
+                            | android.os.FileObserver.DELETE | android.os.FileObserver.MOVED_FROM) {
                 @Override
                 public void onEvent(int event, String path) {
                     if (!"icons".equals(path)) return;
+                    // 只有删除事件时先等系统把新包放好，再触发重写
                     h.removeCallbacks(notify);
                     h.postDelayed(notify, 5000);
                 }

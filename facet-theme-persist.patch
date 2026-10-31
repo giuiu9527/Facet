@@ -1,0 +1,107 @@
+--- a/src/app/facet/kit/Const.java
++++ b/src/app/facet/kit/Const.java
+@@ -31,5 +31,12 @@
+     static final String MODE_DESK = "desk";
+     static final String MODE_NOTIF = "notif";
+ 
++    /**
++     * 已写入主题图标包的应用列表（换行分隔），存一份在偏好里。
++     * 主题包会被系统整体重建（换主题 / 深色模式切换 / 开机），包内记录会随之消失，
++     * 只有这份持久记录能让「自动重写」知道该恢复哪些应用。
++     */
++    static final String WRITTEN = "w_";
++
+     private Const() {}
+ }
+\ No newline at end of file
+--- a/src/app/facet/kit/Hook.java
++++ b/src/app/facet/kit/Hook.java
+@@ -596,10 +596,13 @@
+             };
+             themeObserver = new android.os.FileObserver(new java.io.File(ThemeIcons.THEME_DIR),
+                     android.os.FileObserver.CLOSE_WRITE | android.os.FileObserver.MOVED_TO
+-                            | android.os.FileObserver.CREATE) {
++                            | android.os.FileObserver.CREATE
++                            // 系统重建/清理主题包时是「删除后再创建」，只监听创建会漏掉删除那一步
++                            | android.os.FileObserver.DELETE | android.os.FileObserver.MOVED_FROM) {
+                 @Override
+                 public void onEvent(int event, String path) {
+                     if (!"icons".equals(path)) return;
++                    // 只有删除事件时先等系统把新包放好，再触发重写
+                     h.removeCallbacks(notify);
+                     h.postDelayed(notify, 5000);
+                 }
+--- a/src/app/facet/kit/ThemeIcons.java
++++ b/src/app/facet/kit/ThemeIcons.java
+@@ -88,27 +88,38 @@
+             ensureBase();
+             su("cp " + THEME_ICONS + " " + src.getAbsolutePath() + " && chmod 644 " + src.getAbsolutePath());
+ 
+-            Set<String> before = readWritten(src);
++            Set<String> before = readWritten(src);      // 主题包里记录的（系统重建后可能为空）
++            Set<String> known = new LinkedHashSet<>(before);
++            if (known.isEmpty()) known.addAll(persistedWritten(ctx));   // 包被整体重建 → 用持久记录兜底
+             Set<String> target = new LinkedHashSet<>();
+             if (MODE_ALL.equals(mode)) {
+                 target.addAll(custom.keySet());
+             } else if (MODE_KEEP.equals(mode)) {
+-                // 自动重写：只恢复上次写过、且现在仍有自定义图标的应用
+-                for (String p : before) if (custom.containsKey(p)) target.add(p);
++                // 自动重写：优先恢复「上次写过」的那批；若连持久记录都没有（老版本升级），
++                // 就把所有「桌面生效」的图标写一次，避免系统重建后彻底静默。
++                if (known.isEmpty()) {
++                    target.addAll(custom.keySet());
++                } else {
++                    for (String p : known) if (custom.containsKey(p)) target.add(p);
++                }
+                 if (stampOf(ctx).equals(readStamp(src)) && before.equals(target)) {
+                     return custom.isEmpty() ? "主题包里没有本模块写入的图标" : "桌面图标已是最新";
+                 }
+             } else if (mode.startsWith("one:")) {
+-                target.addAll(before);
++                target.addAll(known);
+                 String p = mode.substring(4);
+                 if (custom.containsKey(p)) target.add(p); else target.remove(p);
+             } else if (mode.startsWith("remove:")) {
+-                target.addAll(before);
++                target.addAll(known);
+                 target.remove(mode.substring(7));
+             }
+ 
+             int changed = rewrite(src, out, custom, target, stampOf(ctx));
+             push(ctx, out);
++            // 把这次实际写入的集合持久化：主题包被系统重建后仍能据此恢复
++            Set<String> done = new LinkedHashSet<>();
++            for (String p : target) if (custom.containsKey(p)) done.add(p);
++            savePersistedWritten(ctx, done);
+             if (changed == 0) return "没有需要变化的图标";
+             return "已写入 " + changed + " 项并重启桌面";
+         } catch (IOException e) {
+@@ -213,6 +224,27 @@
+         } catch (Exception ignored) {
+         }
+         return s;
++    }
++
++    /**
++     * 已写入记录在偏好里另存一份。
++     * 主题包会被系统整体重建（换主题 / 深色模式切换 / 开机），包内 facet/written 会一起消失，
++     * 只靠 zip 内的记录会导致「自动重写时不知道该写谁」，表现为图标掉了再也不会自己回来。
++     */
++    private static Set<String> persistedWritten(Context ctx) {
++        Set<String> s = new LinkedHashSet<>();
++        String v = prefs(ctx).getString(Const.WRITTEN, "");
++        if (v == null) return s;
++        for (String line : v.split("\n")) {
++            if (!line.trim().isEmpty()) s.add(line.trim());
++        }
++        return s;
++    }
++
++    private static void savePersistedWritten(Context ctx, Set<String> set) {
++        StringBuilder sb = new StringBuilder();
++        for (String p : set) sb.append(p).append('\n');
++        prefs(ctx).edit().putString(Const.WRITTEN, sb.toString()).commit();
+     }
+ 
+     /**
